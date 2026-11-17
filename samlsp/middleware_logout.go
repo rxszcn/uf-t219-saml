@@ -2,6 +2,7 @@ package samlsp
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"slices"
@@ -36,6 +37,13 @@ var errNoLogoutRequestTracker = errors.New("saml: single logout needs Middleware
 // errSLOUnexpectedMessage is passed to OnError by ServeSLO when the request
 // carries neither a SAMLRequest nor a SAMLResponse.
 var errSLOUnexpectedMessage = errors.New("saml: single logout endpoint received neither a SAMLRequest nor a SAMLResponse")
+
+// errLogoutNotSuccess is passed to OnError, with its response discarded, when
+// the IdP answers a pending LogoutRequest with a status other than Success.
+// It wraps the error matching saml.ErrBadStatus that says which status the
+// IdP reported. The logout nevertheless ends: the request stops being
+// tracked, the local session is deleted and the browser is redirected.
+var errLogoutNotSuccess = errors.New("saml: the identity provider did not complete the logout")
 
 // HandleStartLogout starts SP initiated single logout. It deletes the local
 // session and sends the browser to the IDP with a LogoutRequest for the
@@ -234,10 +242,21 @@ func (m *Middleware) sloBinding() string {
 // HTTP-POST-SimpleSign binding.
 //
 // A LogoutResponse is the IDP's answer to a LogoutRequest sent by
-// HandleStartLogout. It is accepted only if its InResponseTo is the ID of a
-// LogoutRequest pending in LogoutRequestTracker. Once it is validated, the
-// request stops being tracked, the session (if any is left) is deleted and
-// the browser is redirected to "/".
+// HandleStartLogout. It is accepted only if it is valid and its InResponseTo
+// is the ID of a LogoutRequest pending in LogoutRequestTracker. Once it is
+// accepted, the request stops being tracked, the session (if any is left) is
+// deleted and the browser is redirected to "/".
+//
+// The status of the response does not change that: the IdP ends the logout
+// with its response, whether or not it succeeded. A response whose status is
+// not Success, such as Responder, ends the logout here too: the status is
+// passed to OnError for logging, whose response is discarded, and the browser
+// is redirected. A response whose second-level status is PartialLogout is
+// treated as Success, and the warning is only logged: the user has been
+// logged out of this SP, and the IdP reports that other SPs may keep their
+// sessions (saml-core-2.0-os §3.7.3.2). Only a response that is invalid, or
+// that answers no pending request, is passed to OnError with its response
+// returned to the browser, and only then is the request left tracked.
 //
 // A LogoutRequest is IDP initiated single logout. Once it is validated, the
 // session of the requesting browser is deleted if the request names it (its
@@ -304,9 +323,17 @@ func (m *Middleware) serveSLOResponse(w http.ResponseWriter, r *http.Request) {
 		possibleRequestIDs = append(possibleRequestIDs, tr.SAMLRequestID)
 	}
 
-	logoutResponse, err := m.ServiceProvider.ParseLogoutResponse(r, possibleRequestIDs)
-	if err != nil {
-		m.OnError(w, r, err)
+	// ParseLogoutResponse returns the response together with an error
+	// matching saml.ErrBadStatus when the response is valid and answers one
+	// of possibleRequestIDs, but its status is not Success. It returns a nil
+	// response for any other failure: a bad signature, a Destination or
+	// Issuer that does not match, or an InResponseTo that answers no pending
+	// request. The IdP has ended the logout in the first case too, so the
+	// logout ends here as well: only a refused response is reported to the
+	// browser and leaves the request tracked for the real answer.
+	logoutResponse, statusErr := m.ServiceProvider.ParseLogoutResponse(r, possibleRequestIDs)
+	if logoutResponse == nil {
+		m.OnError(w, r, statusErr)
 		return
 	}
 
@@ -318,6 +345,20 @@ func (m *Middleware) serveSLOResponse(w http.ResponseWriter, r *http.Request) {
 			m.OnError(w, r, err)
 			return
 		}
+	}
+
+	if statusErr != nil {
+		// The logout is over whatever the IdP reported; the status is logged
+		// rather than shown to the user, who would otherwise be left on an
+		// error page with no way to finish logging out.
+		m.reportBackChannelError(r, fmt.Errorf("%w: %w", errLogoutNotSuccess, statusErr))
+	} else if second := logoutResponse.Status.StatusCode.StatusCode; second != nil &&
+		second.Value == saml.StatusPartialLogout {
+		// Not a failure: the user is logged out of this SP. Only the IdP knows
+		// that other SPs may keep their sessions (saml-core-2.0-os §3.7.3.2),
+		// so it is logged rather than shown to the user.
+		log.Printf("WARNING: samlsp: the IDP answered the logout with %s: other service providers may keep their sessions",
+			saml.StatusPartialLogout)
 	}
 
 	if err := m.Session.DeleteSession(w, r); err != nil {

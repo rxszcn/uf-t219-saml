@@ -422,13 +422,21 @@ func TestServeSLOLogoutResponse(t *testing.T) {
 		assert.Check(t, is.Equal(http.StatusForbidden, resp.Code))
 	})
 
-	t.Run("rejects a failed logout", func(t *testing.T) {
+	// A valid response that answers the pending request ends the logout
+	// whatever its status: only a status that is not Success is still
+	// reported, and only for logging (see logout_response_status_test.go).
+	t.Run("ends the logout on a failed logout", func(t *testing.T) {
+		var gotErr error
+		lt.m.OnError = func(_ http.ResponseWriter, _ *http.Request, err error) { gotErr = err }
+		tracking := lt.trackLogoutRequest(t, "id-sp-logout-request")
 		resp := lt.postToSLO(
 			signedResponse(t, func(lr *saml.LogoutResponse) {
-				lr.Status.StatusCode.Value = "urn:oasis:names:tc:SAML:2.0:status:Responder"
-			}),
-			lt.trackLogoutRequest(t, "id-sp-logout-request"))
-		assert.Check(t, is.Equal(http.StatusForbidden, resp.Code))
+				lr.Status.StatusCode.Value = saml.StatusResponder
+			}), tracking)
+		assert.Check(t, is.Equal(http.StatusFound, resp.Code))
+		assert.Check(t, is.Equal("/", resp.Header().Get("Location")))
+		assert.Check(t, is.ErrorIs(gotErr, errLogoutNotSuccess))
+		assert.Check(t, is.ErrorIs(gotErr, saml.ErrBadStatus{Status: saml.StatusResponder}))
 	})
 
 	t.Run("without a tracker", func(t *testing.T) {

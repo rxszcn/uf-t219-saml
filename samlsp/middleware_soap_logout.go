@@ -54,8 +54,8 @@ func (m *Middleware) terminateSessions(r *http.Request, logoutRequest *saml.Logo
 }
 
 // reportBackChannelError passes err to OnError, for logging, and discards
-// what OnError writes: the request comes from the IDP, not a browser, and is
-// answered with a SOAP message instead.
+// what OnError writes: no browser is waiting for it, or, for a front-channel
+// report, the browser is answered by the logout flow instead of an error page.
 func (m *Middleware) reportBackChannelError(r *http.Request, err error) {
 	m.OnError(&discardResponseWriter{header: http.Header{}}, r, err)
 }
